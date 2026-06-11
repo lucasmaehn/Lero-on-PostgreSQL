@@ -2,13 +2,16 @@ import argparse
 import math
 
 from feature import *
-from model import LeroModel, LeroModelPairWise
+from model import LeroModel, LeroModelPairWise, LeroModelListWise
 
 
 def _load_pointwise_plans(path):
     with open(path, "r") as f:
         return [line.strip() for line in f.readlines()]
 
+def _load_listwise_plans(path):
+    with open(path, "r") as f:
+        return [line.strip().split("#####") for line in f.readlines()]
 
 def _load_pairwise_plans(path):
     X1, X2 = [], []
@@ -71,38 +74,6 @@ def compute_rank_score(path, pretrain=False, rank_score_type=0):
     return X, Y
 
 
-def training_pairwise(tuning_model_path, model_name, training_data_file, pretrain=False):
-    X1, X2 = _load_pairwise_plans(training_data_file)
-
-    tuning_model = tuning_model_path is not None
-    lero_model = None
-    if tuning_model:
-        lero_model = LeroModelPairWise(None)
-        lero_model.load(tuning_model_path)
-        feature_generator = lero_model._feature_generator
-    else:
-        feature_generator = FeatureGenerator()
-        feature_generator.fit(X1 + X2)
-
-    Y1, Y2 = None, None
-    if pretrain:
-        Y1 = [json.loads(c)[0]['Plan']['Total Cost'] for c in X1]
-        Y2 = [json.loads(c)[0]['Plan']['Total Cost'] for c in X2]
-        X1, _ = feature_generator.transform(X1)
-        X2, _ = feature_generator.transform(X2)
-    else:
-        X1, Y1 = feature_generator.transform(X1)
-        X2, Y2 = feature_generator.transform(X2)
-    print("Training data set size = " + str(len(X1)))
-
-    if not tuning_model:
-        assert lero_model == None
-        lero_model = LeroModelPairWise(feature_generator)
-    lero_model.fit(X1, X2, Y1, Y2, tuning_model)
-
-    print("saving model...")
-    lero_model.save(model_name)
-
 
 def training_with_rank_score(tuning_model_path, model_name, training_data_file, pretrain=False, rank_score_type=0):
     X, Y = compute_rank_score(training_data_file, pretrain, rank_score_type)
@@ -157,6 +128,78 @@ def training_pointwise(tuning_model_path, model_name, training_data_file):
 
     print("saving model...")
     lero_model.save(model_name)
+
+def training_pairwise(tuning_model_path, model_name, training_data_file, pretrain=False):
+    X1, X2 = _load_pairwise_plans(training_data_file)
+
+    tuning_model = tuning_model_path is not None
+    lero_model = None
+    print(type(X1+X2))
+    if tuning_model:
+        lero_model = LeroModelPairWise(None)
+        lero_model.load(tuning_model_path)
+        feature_generator = lero_model._feature_generator
+    else:
+        feature_generator = FeatureGenerator()
+        feature_generator.fit(X1 + X2)
+
+    Y1, Y2 = None, None
+    if pretrain:
+        Y1 = [json.loads(c)[0]['Plan']['Total Cost'] for c in X1]
+        Y2 = [json.loads(c)[0]['Plan']['Total Cost'] for c in X2]
+        X1, _ = feature_generator.transform(X1)
+        X2, _ = feature_generator.transform(X2)
+    else:
+        X1, Y1 = feature_generator.transform(X1)
+        X2, Y2 = feature_generator.transform(X2)
+    print("Training data set size = " + str(len(X1)))
+
+    if not tuning_model:
+        assert lero_model == None
+        lero_model = LeroModelPairWise(feature_generator)
+    lero_model.fit(X1, X2, Y1, Y2, tuning_model)
+
+    print("saving model...")
+    lero_model.save(model_name)
+
+
+def training_listwise(tuning_model_path, model_name, training_data_file):
+    plans = _load_listwise_plans(training_data_file)
+
+    tuning_model = tuning_model_path is not None
+    lero_model = None
+    if tuning_model:
+        lero_model = LeroModelListWise(None)
+        lero_model.load(tuning_model_path)
+        feature_generator = lero_model._feature_generator
+    else:
+        feature_generator = FeatureGenerator()
+        feature_generator.fit([x for group in plans for x in group])
+
+    Xs = []
+    Ys = []
+
+    for i in range(len(plans)):
+        x,y = feature_generator.transform(plans[i])
+        Xs.append(x)
+        Ys.append(y)
+
+    print(type(Xs[0]))
+
+    assert len(Xs) == len(Ys)
+    print("Training data set size = " + str(len(Xs)))
+
+    if not tuning_model:
+        assert lero_model == None
+        lero_model = LeroModelListWise(feature_generator)
+
+    lero_model.fit(Xs, Ys, tuning_model)
+    print("saving model...")
+    lero_model.save(model_name)
+
+
+
+
 
 
 if __name__ == "__main__":
@@ -215,5 +258,9 @@ if __name__ == "__main__":
         print("pre-training_with_rank_score")
         training_with_rank_score(
             pretrain_model_name, model_name, training_data, True, rank_score_training_type)
+    elif training_type == 5:
+        print("training_listwise")
+        training_listwise(pretrain_model_name, model_name, training_data)
+
     else:
         raise Exception()

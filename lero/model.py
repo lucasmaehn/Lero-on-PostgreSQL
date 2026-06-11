@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim
 from torch.utils.data import DataLoader
 
+import torch.nn.functional as F
 from feature import SampleEntity
 from TreeConvolution.tcnn import (BinaryTreeConv, DynamicPooling,
                                   TreeActivation, TreeLayerNorm)
@@ -51,6 +52,14 @@ def collate_pairwise_fn(x):
         labels.append(label)
     return trees1, trees2, labels
 
+def collate_listwise_fn(batch):
+    """
+    batch: list of (x_list, y_list) tuples, one per query group
+    Returns list of (trees_placeholder, y_tensor) — trees built later per-group
+    since build_trees needs the net.
+    """
+    return [(x_list, torch.tensor(np.array(y_list), dtype=torch.float32))
+            for x_list, y_list in batch]
 
 def transformer(x: SampleEntity):
     return x.get_feature()
@@ -309,4 +318,140 @@ class LeroModelPairWise(LeroModel):
 
             print("Epoch", epoch, "training loss:", loss_accum)
         print("training time:", time() - start_time, "batch size:", batch_size)
-        
+
+class LeroModelListWise(LeroModel):
+    def __init__(self, feature_generator) -> None:
+        super().__init__(feature_generator)
+
+    def fit(self, Xs, Ys, pre_training=False, k=None):
+        assert len(Xs) == len(Ys)
+
+        # if no preloaded model, we have to define it here
+        if not pre_training:
+            input_feature_dim = len(Xs[0][0].get_feature())
+            print("input_feature_dim:", input_feature_dim)
+
+            self._net = LeroNet(input_feature_dim)
+            self._input_feature_dim = input_feature_dim
+            if CUDA:
+                self._net = self._net.cuda(device)
+                self._net = torch.nn.DataParallel(
+                    self._net, device_ids=GPU_LIST)
+                self._net.cuda(device)
+
+        groups = [(Xs[i], Ys[i]) for i in range(len(Xs))]
+
+        batch_size = 16
+        if CUDA:
+            batch_size = batch_size * len(GPU_LIST)
+
+        dataset = DataLoader(groups,
+                             batch_size=batch_size,
+                             shuffle=True,
+                             collate_fn=collate_listwise_fn)
+
+        optimizer = None
+        if CUDA:
+            optimizer = torch.optim.Adam(self._net.module.parameters())
+            optimizer = nn.DataParallel(optimizer, device_ids=GPU_LIST)
+        else:
+            optimizer = torch.optim.Adam(self._net.parameters())
+
+        bce_loss_fn = torch.nn.BCELoss()
+
+
+        start_time = time()
+        for epoch in range(100):
+            loss_acc = 0.0
+            n_batches = 0
+
+            for group_batch in dataset:
+                batch_loss = None
+                for x_list, y in group_batch:
+                    if CUDA:
+                        y = y.cuda(device)
+
+                    if y.max() == y.min():
+                        continue
+
+                    if CUDA:
+                        trees = self._net.module.build_trees(x_list)
+                    else:
+                        trees = self._net.build_trees(x_list)
+
+                    scores = self._net(trees).squeeze(-1)
+
+                    y_min, y_max = y.min(), y.max()
+                    relevance = (y_max - y) / (y_max - y_min + 1e-9)
+
+
+                    loss = self._lambda_loss(scores, relevance, k=k)
+
+                    batch_loss = loss if batch_loss is None else batch_loss + loss
+
+                if batch_loss is None:
+                    continue
+
+                optimizer.zero_grad()
+                batch_loss.backward()
+                optimizer.step()
+
+                loss_acc += batch_loss.item()
+                n_batches+=1
+
+            if n_batches > 0:
+                loss_acc /= n_batches
+            print("Epoch", epoch, "training loss:", loss_acc)
+        print("training time:", time() - start_time, "batch size:", batch_size)
+
+
+    @staticmethod
+    def _lambda_loss(
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        k: int | None = None,
+        sigma: float = 1.0,
+        eps: float = 1e-10,
+    ) -> torch.Tensor:
+        """LambdaLoss for a single query group."""
+        n = scores.size(0)
+        device = scores.device
+
+        # ideal DCG for normalization
+        sorted_labels, _ = labels.sort(descending=True)
+        if k is not None:
+            sorted_labels_k = sorted_labels[:k]
+        else:
+            sorted_labels_k = sorted_labels
+        positions = torch.arange(2, sorted_labels_k.size(0) + 2,
+                                 dtype=torch.float32, device=device)
+        idcg = ((2.0 ** sorted_labels_k - 1.0) / torch.log2(positions)).sum()
+
+        if idcg < eps:
+            return scores.sum() * 0.0   # keep graph alive, zero loss
+
+        # current ranks from scores
+        _, score_order = scores.sort(descending=True)
+        _, ranks = score_order.sort()
+        ranks = ranks.float() + 1.0     # 1-indexed
+
+        # pairwise gain and discount deltas
+        gains = 2.0 ** labels - 1.0                                          # (n,)
+        gain_diff = (gains.unsqueeze(1) - gains.unsqueeze(0)).abs()          # (n, n)
+
+        discounts = 1.0 / torch.log2(ranks + 1.0)                           # (n,)
+        discount_diff = (discounts.unsqueeze(1) - discounts.unsqueeze(0)).abs()  # (n, n)
+
+        delta_ndcg = (gain_diff * discount_diff) / idcg                      # (n, n)
+
+        # only pairs where i is strictly more relevant than j
+        valid_pairs = (labels.unsqueeze(1) - labels.unsqueeze(0)) > 0        # (n, n)
+
+        # weighted log loss — lambda weights detached, loss differentiated through scores
+        score_diff = scores.unsqueeze(1) - scores.unsqueeze(0)               # s_i - s_j
+        log_loss = F.softplus(-sigma * score_diff)                           # (n, n)
+
+        weighted_loss = (log_loss * delta_ndcg * valid_pairs.float()).sum()
+
+
+        return weighted_loss / idcg

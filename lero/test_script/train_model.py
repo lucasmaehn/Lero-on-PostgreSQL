@@ -72,7 +72,7 @@ class LeroHelper():
         create_training_file(training_data_file, self.output_query_latency_file, self.output_query_latency_file + "_exploratory")
         print("retrain Lero model:", model_name, "with file", training_data_file)
         
-        cmd_str = "cd " + self.lero_server_path + " && python3.8 train.py" \
+        cmd_str = "cd " + self.lero_server_path + " && python train.py" \
                                                 + " --training_data " + os.path.abspath(training_data_file) \
                                                 + " --model_name " + model_name \
                                                 + " --training_type 1"
